@@ -1,3 +1,4 @@
+import os
 from flask import Flask, request, jsonify
 from pathlib import Path
 import easyocr
@@ -5,7 +6,7 @@ import csv
 import cv2
 import torch
 import time
-import hydra
+import pandas as pd
 from datetime import datetime
 from omegaconf import DictConfig
 from ultralytics.yolo.engine.predictor import BasePredictor
@@ -16,11 +17,18 @@ from Levenshtein import distance
 
 app = Flask(__name__)
 
+# Define output directory
+OUTPUT_DIR = "D:/andex/output/"
+
+# Create output directory if it doesn't exist
+if not os.path.exists(OUTPUT_DIR):
+    os.makedirs(OUTPUT_DIR)
+
 # Define DEFAULT_CONFIG object
 DEFAULT_CONFIG = DictConfig({
     "model": "yolov8n.pt",  # Default YOLO model path
     "imgsz": 640,  # Default input image size
-    "project": "output",
+    "project": OUTPUT_DIR,
     "name": "run1",
     "exist_ok": True,  # Whether it's okay if the directory already exists
     "save": False,  # Whether saving is enabled or not
@@ -47,8 +55,8 @@ reader = easyocr.Reader(['en'])
 
 previous_frames = {}  # Define previous_frames dictionary here
 
+# Function to extract details from the number plate
 def getOCR(im):
-    # Function to extract details from the number plate
     gray_plate = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
     rgb_plate = cv2.cvtColor(gray_plate, cv2.COLOR_GRAY2RGB)
     results = reader.readtext(rgb_plate)
@@ -104,7 +112,7 @@ class DetectionPredictor(BasePredictor):
             return log_string
         
         # Initialize CSV writer outside the loop
-        csv_file_path = f"D:/andex/output/{self.data_path.stem}_number_plate_details.csv"
+        csv_file_path = f"{OUTPUT_DIR}/{self.data_path.stem}_number_plate_details.csv"
 
         with open(csv_file_path, 'a', newline='', encoding='utf-8') as csvfile:
             csv_writer = csv.writer(csvfile)
@@ -123,7 +131,7 @@ class DetectionPredictor(BasePredictor):
                     # Check if the current vehicle is significantly different from previously detected ones across frames
                     skip = False
                     for prev_label, prev_details in previous_frames.items():
-                        if distance(plate_details, prev_details) <= 4:
+                        if distance(plate_details, prev_details) <= 2.5:
                             skip = True
                             break
                     if not skip:
@@ -157,7 +165,7 @@ def process_video(video_path, save_dir):
     cfg.model = str(cfg.model) if isinstance(cfg.model, Path) else cfg.model or "yolov8n.pt"
     cfg.imgsz = check_imgsz(cfg.imgsz, min_dim=2)  # check image size
     cfg.source = str(video_path)  # Convert video path to string
-    cfg.save_dir = str(save_dir)  # Convert save directory path to string
+    cfg.save_dir = save_dir  # Use provided save directory path
     cfg.show = False
     
     predictor = DetectionPredictor(cfg)
@@ -171,6 +179,8 @@ def detect_from_live_camera():
     predictor = DetectionPredictor(cfg)
     predictor()
 
+import pandas as pd
+
 @app.route('/process_video', methods=['POST'])
 def process_video_route():
     # Receive video file and save_dir from client
@@ -178,20 +188,30 @@ def process_video_route():
         return jsonify({'error': 'No file part in the request'}), 400
     
     video_file = request.files['file']
-    save_dir = request.form.get('save_dir', 'output')  # Default save_dir is 'output'
+    save_dir = request.form.get('save_dir', OUTPUT_DIR)  # Default save_dir is OUTPUT_DIR
     
-    video_path = 'temp_video.mp4'  # Save the video temporarily
+    video_path = 'video_output\\test2.mp4'  # Save the video temporarily
     video_file.save(video_path)
 
     # Process the video
     process_video(video_path, save_dir)
     
+    # Construct the CSV file path
+    csv_file_path = f"{save_dir}/{Path(video_path).stem}_number_plate_details.csv"
+
+    # Read the CSV file into a DataFrame
+    try:
+        df = pd.read_csv(csv_file_path, names=['Number Plate Details', 'Date', 'Time'])
+    except FileNotFoundError:
+        return jsonify({'error': 'CSV file not found'}), 404
+    
+    # Convert DataFrame to list of dictionaries
+    data = df.to_dict(orient='records')
+
     # Delete the temporary video file
     Path(video_path).unlink()
 
-    return jsonify({'message': 'Video processing complete'})
-
-
+    return jsonify(data), 200, {'Content-Type': 'application/json'}
 
 if __name__ == "__main__":
-    app.run(debug=True,port=5001)
+    app.run(debug=True, port=5005, host="0.0.0.0")
