@@ -131,7 +131,7 @@ class DetectionPredictor(BasePredictor):
                     # Check if the current vehicle is significantly different from previously detected ones across frames
                     skip = False
                     for prev_label, prev_details in previous_frames.items():
-                        if distance(plate_details, prev_details) <= 2.5:
+                        if distance(plate_details, prev_details) <= 3:
                             skip = True
                             break
                     if not skip:
