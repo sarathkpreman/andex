@@ -5,7 +5,6 @@ import easyocr
 import csv
 import cv2
 import torch
-import time
 import pandas as pd
 from datetime import datetime
 from omegaconf import DictConfig
@@ -14,6 +13,7 @@ from ultralytics.yolo.utils import DEFAULT_CONFIG, ROOT, ops
 from ultralytics.yolo.utils.checks import check_imgsz
 from ultralytics.yolo.utils.plotting import Annotator, colors, save_one_box
 from Levenshtein import distance
+import re
 
 app = Flask(__name__)
 
@@ -32,7 +32,7 @@ DEFAULT_CONFIG = DictConfig({
     "name": "run1",
     "exist_ok": True,  # Whether it's okay if the directory already exists
     "save": False,  # Whether saving is enabled or not
-    "conf": 0.5,  # Confidence threshold
+    "conf": 0.3,  # Confidence threshold
     "data": {},  # Placeholder for data-related configurations
     "device": "cpu",  # Default device to run the model
     "half": False,  # Whether to use half precision inference
@@ -40,7 +40,7 @@ DEFAULT_CONFIG = DictConfig({
     "vid_stride": 1,  # Video stride
     "visualize": True,
     "augment": True,  # or false, depending on your preference
-    "iou": 0.5,  # or any other desired value for Intersection over Union threshold
+    "iou": 0.7,  # or any other desired value for Intersection over Union threshold
     "agnostic_nms": True,  # or false, depending on your desired behavior
     "max_det": 100,  # Default maximum number of detections
     "line_thickness": 3,  # Default line thickness for annotations
@@ -59,11 +59,39 @@ previous_frames = {}  # Define previous_frames dictionary here
 def getOCR(im):
     gray_plate = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
     rgb_plate = cv2.cvtColor(gray_plate, cv2.COLOR_GRAY2RGB)
-    results = reader.readtext(rgb_plate)
+    results = reader.readtext(rgb_plate, detail=0, paragraph=True)
     text = ""
+    state_code_found = False
     for result in results:
-        text += result[1] + " "  # Add a whitespace between each detail
-    return text.strip()  # Strip leading and trailing whitespace
+        # Check if the text matches the number plate format
+        if re.match(r'^[ANAPARASBRCGCHDDDLGAGJHPHRJHJKKAKLLAMHMLMNMPMZNLODPBPYRJSKTGTNTRUKUPWB]{2}\d{2}[A-HJ-NP-Za-hj-np-z]{1,3}\d{4}$', result.strip()):
+            # Ensure all letters are uppercase and add proper gaps
+            formatted_text = result.strip().upper()
+            formatted_text = formatted_text[:2] + ' ' + formatted_text[2:4] + ' ' + formatted_text[4:7] + ' ' + formatted_text[7:]
+            # Insert a space between the third and fourth characters of the last part
+            formatted_text = formatted_text[:9] + ' ' + formatted_text[9:]
+            text = formatted_text
+            break
+    return text
+
+
+# Track the positions of extracted data across consecutive frames
+class PositionTracker:
+    def __init__(self):
+        self.prev_positions = None
+
+    def track_positions(self, current_positions):
+        if self.prev_positions is None:
+            self.prev_positions = current_positions
+            return True
+        
+        # Compare current positions with previous positions
+        consistent = current_positions == self.prev_positions
+        self.prev_positions = current_positions
+        return consistent
+
+# Initialize position tracker
+position_tracker = PositionTracker()
 
 class DetectionPredictor(BasePredictor):
     def get_annotator(self, img):
@@ -131,20 +159,17 @@ class DetectionPredictor(BasePredictor):
                     # Check if the current vehicle is significantly different from previously detected ones across frames
                     skip = False
                     for prev_label, prev_details in previous_frames.items():
-                        if distance(plate_details, prev_details) <= 3.5:
+                        if distance(plate_details, prev_details) <= 2.1:
                             skip = True
                             break
                     if not skip:
                         # Update dictionary with current vehicle details
                         previous_frames[label] = plate_details
-                        # Split multiline details and write each one on a separate row
-                        details = plate_details.split('\n')
-                        for detail in details:
-                            # Write each detail along with the current date and time as a row in the CSV file
-                            csv_writer.writerow([detail, current_date, current_time])
-                        log_string += f"{label} OCR saved to {csv_file_path}, "
+                        # Write plate details along with the current date and time as a row in the CSV file
+                        csv_writer.writerow([plate_details, current_date, current_time])
+                        log_string += f"{plate_details} OCR saved to {csv_file_path}, "
                     else:
-                        log_string += f"Skipped saving {label} OCR as redundant, "
+                        log_string += f"Skipped saving {plate_details} OCR as redundant, "
                 else:
                     log_string += f"No text detected from number plate {label}, "
                 
@@ -160,26 +185,27 @@ class DetectionPredictor(BasePredictor):
 
         return log_string
 
-def process_video(video_path, save_dir):
-    cfg = DEFAULT_CONFIG
+def process_video(video_path, save_dir, frame_stride):
+    cfg = DictConfig(DEFAULT_CONFIG)
     cfg.model = str(cfg.model) if isinstance(cfg.model, Path) else cfg.model or "yolov8n.pt"
     cfg.imgsz = check_imgsz(cfg.imgsz, min_dim=2)  # check image size
     cfg.source = str(video_path)  # Convert video path to string
     cfg.save_dir = save_dir  # Use provided save directory path
     cfg.show = False
-    
+    cfg.vid_stride = frame_stride  # Set frame stride
+
     predictor = DetectionPredictor(cfg)
     predictor()
 
-def detect_from_live_camera():
-    cfg = DEFAULT_CONFIG
+def detect_from_live_camera(frame_stride):
+    cfg = DictConfig(DEFAULT_CONFIG)
     cfg.model = cfg.model or "yolov8n.pt"
     cfg.imgsz = check_imgsz(cfg.imgsz, min_dim=2)  # check image size
     cfg.source = 0  # Use default camera
+    cfg.vid_stride = frame_stride  # Set frame stride
+
     predictor = DetectionPredictor(cfg)
     predictor()
-
-import pandas as pd
 
 @app.route('/process_video', methods=['POST'])
 def process_video_route():
@@ -189,12 +215,13 @@ def process_video_route():
     
     video_file = request.files['file']
     save_dir = request.form.get('save_dir', OUTPUT_DIR)  # Default save_dir is OUTPUT_DIR
+    frame_stride = int(request.form.get('frame_stride', 28))  # Frame stride, default is 1
     
-    video_path = 'video_output\\test2.mp4'  # Save the video temporarily
+    video_path = 'video_output\\test1.mp4'  # Save the video temporarily
     video_file.save(video_path)
 
-    # Process the video
-    process_video(video_path, save_dir)
+    # Process the video with frame sampling
+    process_video(video_path, save_dir, frame_stride)
     
     # Construct the CSV file path
     csv_file_path = f"{save_dir}/{Path(video_path).stem}_number_plate_details.csv"
@@ -214,4 +241,4 @@ def process_video_route():
     return jsonify(data), 200, {'Content-Type': 'application/json'}
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5005, host="0.0.0.0")
+    app.run(debug=True, port=5010, host="0.0.0.0")
